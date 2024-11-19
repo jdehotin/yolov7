@@ -14,7 +14,7 @@ from utils.datasets import create_dataloader
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
     box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
 from utils.metrics import ap_per_class, ConfusionMatrix
-from utils.plots import plot_images, output_to_target, plot_study_txt
+from utils.plots import plot_images, output_to_target, plot_study_txt, append_to_txt
 from utils.torch_utils import select_device, time_synchronized, TracedModel
 
 
@@ -23,7 +23,7 @@ def test(data,
          batch_size=32,
          imgsz=640,
          conf_thres=0.001,
-         iou_thres=0.6,  # for NMS
+         iou_thres=0.6,  # used for NMS
          save_json=False,
          single_cls=False,
          augment=False,
@@ -40,8 +40,11 @@ def test(data,
          half_precision=True,
          trace=False,
          is_coco=False,
-         v5_metric=False):
+         v5_metric=False,
+         **kwargs):
     # Initialize/load model and set device
+
+    hyp = kwargs['hyp']
     training = model is not None
     if training:  # called by train.py
         device = next(model.parameters()).device  # get model device
@@ -51,8 +54,16 @@ def test(data,
         device = select_device(opt.device, batch_size=batch_size)
 
         # Directories
-        save_dir = Path(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))  # increment run
-        (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
+
+        if opt.save_path == '':
+            save_dir = Path(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))  # increment run
+        else:
+            save_dir = Path(increment_path(os.path.join(opt.save_path, Path(opt.project) , opt.name), exist_ok=opt.exist_ok))
+
+        try: # no suduer can fail
+            (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
+        except Exception as e:
+            print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",e)
 
         # Load model
         model = attempt_load(weights, map_location=device)  # load FP32 model
@@ -60,10 +71,11 @@ def test(data,
         imgsz = check_img_size(imgsz, s=gs)  # check img_size
         
         if trace:
-            model = TracedModel(model, device, imgsz)
+            model = TracedModel(model, device, imgsz, opt.input_channels)
 
+    #torch.backends.cudnn.benchmark = True  ##uses the inbuilt cudnn auto-tuner to find the fastest convolution algorithms. -
     # Half
-    half = device.type != 'cpu' and half_precision  # half precision only supported on CUDA
+    half = device.type != 'cpu' and half_precision  # half precision only supported on CUDA @@ HK : TODO what are the consequences  add :
     if half:
         model.half()
 
@@ -83,37 +95,50 @@ def test(data,
     if wandb_logger and wandb_logger.wandb:
         log_imgs = min(wandb_logger.log_imgs, 100)
     # Dataloader
+
+
     if not training:
         if device.type != 'cpu':
-            model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
+            model(torch.zeros(1, opt.input_channels, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
         task = opt.task if opt.task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
-        dataloader = create_dataloader(data[task], imgsz, batch_size, gs, opt, pad=0.5, rect=True,
-                                       prefix=colorstr(f'{task}: '))[0]
+        hyp = dict()
+        hyp['person_size_small_medium_th'] = 32 * 32
+        hyp['car_size_small_medium_th'] = 44 * 44
+
+        hyp['img_percentile_removal'] = 0.3
+        hyp['beta'] = 0.3
+        hyp['gamma'] = 80 # dummy anyway augmentation is disabled
+        hyp['gamma_liklihood'] = 0.01
+        # augment=False explicit no augmentation to test
+        dataloader = create_dataloader(data[task], imgsz, batch_size, gs, opt, hyp, pad=0.5, augment=False, rect=False, #rect was True  # HK@@@ TODO : why pad =0.5?? only effective in rect=True in test time ? https://github.com/ultralytics/ultralytics/issues/13271
+                                       prefix=colorstr(f'{task}: '), rel_path_images=data['path'], num_cls=data['nc'])[0]
 
     if v5_metric:
         print("Testing with YOLOv5 AP metric...")
     
     seen = 0
-    confusion_matrix = ConfusionMatrix(nc=nc)
+    confusion_matrix = ConfusionMatrix(nc=nc, conf=conf_thres, iou_thres=iou_thres) # HK per conf per iou_thresh
     names = {k: v for k, v in enumerate(model.names if hasattr(model, 'names') else model.module.names)}
     coco91class = coco80_to_coco91_class()
     s = ('%20s' + '%12s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
     p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
+    stats_all_large, stats_person_medium = [], []
     for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
         img = img.to(device, non_blocking=True)
-        img = img.half() if half else img.float()  # uint8 to fp16/32
-        img /= 255.0  # 0 - 255 to 0.0 - 1.0
+        img = img.half() if half else img.float()
+        # uint8 to fp16/32
+        # img /= 255.0  # 0 - 255 to 0.0 - 1.0 c# already done inside dataloader
         targets = targets.to(device)
         nb, _, height, width = img.shape  # batch size, channels, height, width
 
         with torch.no_grad():
             # Run model
             t = time_synchronized()
-            out, train_out = model(img, augment=augment)  # inference and training outputs
+            out, train_out = model(img, augment=augment)  # inference(4 coordination, obj conf, cls conf ) and training outputs(batch_size, anchor per scale, x,y dim of scale out 40x40 ,n_classes-conf+1-objectness+4-bbox ) over 3 scales diferent outputs (2,2,80,80,7), (2,2,40,40,7)  : 640/8=40
             t0 += time_synchronized() - t
-
+            # out coco 80 classes : [1, 25200, 85] [batch, proposals_3_scales,4_box__coord+1_obj_score + n x classes]
             # Compute loss
             if compute_loss:
                 loss += compute_loss([x.float() for x in train_out], targets)[1][:3]  # box, obj, cls
@@ -122,11 +147,12 @@ def test(data,
             targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
             lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
             t = time_synchronized()
-            out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
+            out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True) # Does thresholding for class  : list of detections, on (n,6) tensor per image [xyxy, conf, cls]
+            # out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=False) # Does thresholding for class  : list of detections, on (n,6) tensor per image [xyxy, conf, cls]
             t1 += time_synchronized() - t
 
         # Statistics per image
-        for si, pred in enumerate(out):
+        for si, pred in enumerate(out): # [bbox_coors, objectness_logit, class]
             labels = targets[targets[:, 0] == si, 1:]
             nl = len(labels)
             tcls = labels[:, 0].tolist() if nl else []  # target class
@@ -135,11 +161,13 @@ def test(data,
 
             if len(pred) == 0:
                 if nl:
-                    stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
+                    stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))    #niou for COCO 0.5:0.05:1
+                    stats_all_large.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
+                    stats_person_medium.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
                 continue
 
             # Predictions
-            predn = pred.clone()
+            predn = pred.clone() # *xyxy, conf, cls in predn  [x y ,w ,h, conf, cls] taking top 300 after NMS
             scale_coords(img[si].shape[1:], predn[:, :4], shapes[si][0], shapes[si][1])  # native-space pred
 
             # Append to text file
@@ -175,7 +203,7 @@ def test(data,
                                   'bbox': [round(x, 3) for x in b],
                                   'score': round(p[4], 5)})
 
-            # Assign all predictions as incorrect
+            # Assign all predictions as incorrect ; pred takes top 300 predictions conf over 10 ious [0.5:0.95:0.05]
             correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
             if nl:
                 detected = []  # target indices
@@ -199,7 +227,7 @@ def test(data,
 
                         # Append detections
                         detected_set = set()
-                        for j in (ious > iouv[0]).nonzero(as_tuple=False):
+                        for j in (ious > iouv[0]).nonzero(as_tuple=False): # iouv[0]=0.5 IOU for dectetions iouv in general are all 0.5:0.05:.. for COCO
                             d = ti[i[j]]  # detected target
                             if d.item() not in detected_set:
                                 detected_set.add(d.item())
@@ -208,11 +236,19 @@ def test(data,
                                 if len(detected) == nl:  # all targets already located in image
                                     break
 
-            # Append statistics (correct, conf, pcls, tcls)
-            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
+            # Append statistics (correct, conf_objectness, pcls, tcls) Predicted class is Max-Likelihood among all classes logit and threshol goes over the objectness only
+            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls)) # correct @ IOU=0.5 of pred box with target
+            if not training or 1:
+                # assert len(pred[:, :4]) == 1
+                x, y, w, h = xyxy2xywh(pred[:, :4])[0]
+                if w * h > hyp['person_size_small_medium_th'] and  w * h <= hyp['car_size_small_medium_th']:
+                    stats_person_medium.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
+                if w * h > hyp['car_size_small_medium_th']:
+                    stats_all_large.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
 
-        # Plot images
-        if plots and batch_i < 3:
+        # Plot images  aa = np.repeat(img[0,:,:,:].cpu().permute(1,2,0).numpy(), 3, axis=2).astype('float32') cv2.imwrite('test/exp40/test_batch88_labels__.jpg', aa*255)
+        if plots and batch_i > 10 or 1:
+            # conf_thresh_plot = 0.1 # the plot threshold the connfidence
             f = save_dir / f'test_batch{batch_i}_labels.jpg'  # labels
             Thread(target=plot_images, args=(img, targets, paths, f, names), daemon=True).start()
             f = save_dir / f'test_batch{batch_i}_pred.jpg'  # predictions
@@ -220,22 +256,73 @@ def test(data,
 
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
-    if len(stats) and stats[0].any():
-        p, r, ap, f1, ap_class = ap_per_class(*stats, plot=plots, v5_metric=v5_metric, save_dir=save_dir, names=names)
+
+    if not training or 1:
+        stats_person_medium = [np.concatenate(x, 0) for x in zip(*stats_person_medium)]  # to numpy
+        stats_all_large = [np.concatenate(x, 0) for x in zip(*stats_all_large)]  # to numpy
+
+    if len(stats) and stats[0].any(): # P, R @  # max F1 index
+        p, r, ap, f1, ap_class = ap_per_class(*stats, plot=plots, v5_metric=v5_metric, save_dir=save_dir, names=names) #based on correct @ IOU=0.5 of pred box with target
+        if not training or 1:
+            if bool(stats_person_medium):
+                p_med, r_med, ap_med, f1_med, ap_class_med = ap_per_class(*stats_person_medium, plot=plots, v5_metric=v5_metric, save_dir=save_dir, names=names, tag='small_objects')
+                ap50_med, ap_med = ap_med[:, 0], ap_med.mean(1)  # AP@0.5, AP@0.5:0.95
+                mp_med, mr_med, map50_med, map_med = p_med.mean(), r_med.mean(), ap50_med.mean(), ap_med.mean()
+                nt_med = np.bincount(stats_person_medium[3].astype(np.int64), minlength=nc)  # number of targets per class
+            if bool(stats_all_large):
+                p_large, r_large, ap_large, f1_large, ap_class_large = ap_per_class(*stats_all_large, plot=plots, v5_metric=v5_metric, save_dir=save_dir, names=names, tag='large_objects')
+                ap50_large, ap_large = ap_large[:, 0], ap_large.mean(1)  # AP@0.5, AP@0.5:0.95
+                mp_large, mr_large, map50_large, map_large = p_large.mean(), r_large.mean(), ap50_large.mean(), ap_large.mean()
+                nt_large = np.bincount(stats_all_large[3].astype(np.int64), minlength=nc)  # number of targets per class
+
         ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
+
         nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
     else:
         nt = torch.zeros(1)
+        nt_med = torch.zeros(1)
+        nt_large = torch.zeros(1)
 
     # Print results
     pf = '%20s' + '%12i' * 2 + '%12.3g' * 4  # print format
     print(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
+    if not training or 1:
+        if bool(stats_person_medium):
+            try:
+                print(pf % ('all_medium', seen, nt_med.sum(), mp_med, mr_med, map50_med, map_med))
+            except Exception as e:
+                print(e)
+
+        if bool(stats_all_large):
+            try:
+                print(pf % ('all_large', seen, nt_large.sum(), mp_large, mr_large, map50_large, map_large))
+            except Exception as e:
+                print(e)
+
+    file_path = os.path.join(save_dir, 'class_stats.txt') #'Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95'
+    append_to_txt(file_path, 'all', seen, nt.sum(), mp, mr, map50, map)
 
     # Print results per class
-    if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
+    if 1 or (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
         for i, c in enumerate(ap_class):
             print(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
+            append_to_txt(file_path, names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i])
+        try:
+            if bool(stats_person_medium):
+                for i, c in enumerate(ap_class_med):
+                    print(pf % (names[c]+ '_med', seen, nt_med[c], p_med[i], r_med[i], ap50_med[i], ap_med[i]))
+                    append_to_txt(file_path, names[c] + '_med', seen, nt_med[c], p_med[i], r_med[i], ap50_med[i], ap_med[i])
+        except Exception as e:
+            print(e)
+
+        try:
+            if bool(stats_all_large):
+                for i, c in enumerate(ap_class_large):
+                    print(pf % (names[c]+ '_large', seen, nt_large[c], p_large[i], r_large[i], ap50_large[i], ap_large[i]))
+                    append_to_txt(file_path, names[c] + '_large', seen, nt_large[c], p_large[i], r_large[i], ap50_large[i], ap_large[i])
+        except Exception as e:
+            print(e)
 
     # Print speeds
     t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (imgsz, imgsz, batch_size)  # tuple
@@ -252,7 +339,7 @@ def test(data,
         wandb_logger.log({"Bounding Box Debugger/Images": wandb_images})
 
     # Save JSON
-    if save_json and len(jdict):
+    if save_json and len(jdict): # @@ HK TODO:
         w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
         anno_json = './coco/annotations/instances_val2017.json'  # annotations json
         pred_json = str(save_dir / f"{w}_predictions.json")  # predictions json
@@ -286,7 +373,6 @@ def test(data,
         maps[c] = ap[i]
     return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
 
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='test.py')
     parser.add_argument('--weights', nargs='+', type=str, default='yolov7.pt', help='model.pt path(s)')
@@ -294,7 +380,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=32, help='size of each image batch')
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='object confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.65, help='IOU threshold for NMS')
+    parser.add_argument('--iou-thres', type=float, default=0.6, help='IOU threshold for NMS')
     parser.add_argument('--task', default='val', help='train, val, test, speed or study')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--single-cls', action='store_true', help='treat as single-class dataset')
@@ -309,11 +395,33 @@ if __name__ == '__main__':
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--norm-type', type=str, default='standardization',
+                        choices=['standardization', 'single_image_0_to_1', 'single_image_mean_std','single_image_percentile_0_255',
+                                 'single_image_percentile_0_1', 'remove+global_outlier_0_1'],
+                        help='Normalization approach')
+
+    parser.add_argument('--no-tir-signal', action='store_true', help='')
+
+    parser.add_argument('--tir-channel-expansion', action='store_true', help='drc_per_ch_percentile')
+
+    parser.add_argument('--input-channels', type=int, default=3, help='')
+
+    parser.add_argument('--save-path', default='', help='save to project/name')
+
+
     opt = parser.parse_args()
+
+    if opt.tir_channel_expansion: # operates over 3 channels
+        opt.input_channels = 3
+
+    if opt.tir_channel_expansion and opt.norm_type != 'single_image_percentile_0_1': # operates over 3 channels
+        print('Not a good combination')
+
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.data = check_file(opt.data)  # check file
     print(opt)
     #check_requirements()
+    hyp = dict()
 
     if opt.task in ('train', 'val', 'test'):  # run normally
         test(opt.data,
@@ -330,8 +438,8 @@ if __name__ == '__main__':
              save_hybrid=opt.save_hybrid,
              save_conf=opt.save_conf,
              trace=not opt.no_trace,
-             v5_metric=opt.v5_metric
-             )
+             v5_metric=opt.v5_metric,
+             hyp=hyp)
 
     elif opt.task == 'speed':  # speed benchmarks
         for w in opt.weights:
@@ -351,3 +459,22 @@ if __name__ == '__main__':
             np.savetxt(f, y, fmt='%10.4g')  # save
         os.system('zip -r study.zip study_*.txt')
         plot_study_txt(x=x)  # plot
+"""
+
+--weights ./yolov7/yolov7.pt --device 0 --batch-size 16 --data data/coco_2_tir.yaml --img-size 640 --conf 0.6 --verbose --save-txt --save-hybrid --norm-type single_image_percentile_0_1
+test based on RGB coco model
+--weights ./yolov7/yolov7.pt --device 0 --batch-size 64 --data data/coco_2_tir.yaml --img-size 640 --conf 0.25 --verbose --save-txt --norm-type single_image_percentile_0_1 --project test --task train
+
+--weights ./yolov7/yolov7.pt --device 0 --batch-size 64 --data data/tir_od.yaml --img-size 640 --conf 0.25 --verbose --save-txt --norm-type single_image_percentile_0_1 --project test --task val
+# Using pretrained model
+--weights /mnt/Data/hanoch/runs/train/yolov7434/weights/epoch_099.pt --device 0 --batch-size 4 --data data/tir_od_test_set.yaml --img-size 640 --conf 0.25 --verbose --norm-type single_image_percentile_0_1 --project test --task test
+#vbased on 7555 mAP=82.3
+--weights /mnt/Data/hanoch/runs/train/yolov7563/weights/best.pt --device 0 --batch-size 16 --data data/tir_od_test_set.yaml --img-size 640 --conf 0.02 --verbose --norm-type single_image_percentile_0_1 --input-channels 1 --project test --task test --iou-thres 0.4
+
+/home/hanoch/projects/tir_od/runs/train/yolov7563/weights
+
+
+--weights /mnt/Data/hanoch/runs/train/yolov7575/weights/best.pt --device 0 --batch-size 16 --data data/tir_od_test_set.yaml --img-size 640 --conf 0.001 --verbose --norm-type single_image_percentile_0_1 --input-channels 1 --project test --task test --iou-thres 0.6
+--weights /home/hanoch/projects/tir_od/runs/gpu02/yolov74/weights --device 0 --batch-size 16 --data data/tir_od_test_set.yaml --img-size 640 --conf 0.001 --verbose --norm-type single_image_percentile_0_1 --input-channels 1 --project test --task test --iou-thres 0.6
+
+"""
